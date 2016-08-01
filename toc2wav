@@ -1,0 +1,259 @@
+#!/usr/bin/perl
+# vim: ts=2:sw=2:expandtab:cindent
+
+use 5;
+use strict;
+use Getopt::Long;
+
+sub time2off($) {
+  my $time = shift;
+  return 0 if $time eq '0';
+  my ($min, $sec, $frm) = ($time =~ /(\d{2}):(\d{2}):(\d{2})/);
+  return (($min * 60 + $sec) * 75 + $frm) * 2352;
+}
+
+my $aud = 0;
+my $track = 0;
+my $skip;
+my $fname;
+my $off;
+my $len;
+my $cut = 0;
+my $dir = 0;
+my $otitle = 0;
+my $oisrc = 0;
+my $noout = 0;
+my $wback = 0;
+my @tracks;
+
+sub makewav($$$$$) {
+  return if $noout;
+  my ($track, $fname, $off, $len, $skip) = @_;
+  if (@tracks) {
+    my $go = 0;
+    $track == $_ && $go++ foreach @tracks;
+    return unless $go;
+  }
+  my $size = -s $fname;
+  my $bname = $fname;
+  $bname =~ s/\..+$//;
+  my $outname;
+  if ($dir) {
+    mkdir $bname;
+    $outname = sprintf '%s/%02d.wav', $bname, $track;
+  }
+  else {
+    $outname = sprintf '%s_%02d.wav', $bname, $track;
+  }
+  $skip = 0 if $skip < 0;
+  $off += $skip;
+  $len -= $skip;
+  $len += 2352;
+  $len = $size - $off if $off + $len > $size;
+  printf "%s <= %s+%d (%d bytes)\n", $outname, $fname, $off, $len+44;
+  open IN, '<', $fname;
+  binmode IN;
+  open OUT, '>', $outname;
+  binmode OUT;
+  seek IN, $off, 0;
+  print OUT 'RIFF';
+  print OUT pack 'V', $len + 36;
+  print OUT 'WAVEfmt ';
+  print OUT pack 'V', 16;
+  print OUT pack 'v', 1;
+  print OUT pack 'v', 2;
+  print OUT pack 'V', 44100;
+  print OUT pack 'V', 176400;
+  print OUT pack 'v', 4;
+  print OUT pack 'v', 16;
+  print OUT 'data';
+  print OUT pack 'V', $len;
+  my $pregap = 1;
+  my $postgap = 0;
+  my $wrote = 0;
+  while ($len > 0) {
+    my $buf;
+    read IN, $buf, 2352;
+    if ($cut) {
+      my @arr = unpack 'n*', $buf;
+      if ($pregap) {
+        splice @arr, 0, 2 while @arr && $arr[0] == 0 && $arr[1] == 0;
+        $pregap = 0 if @arr;
+      }
+      else {
+        my $cpost = 0;
+        while (@arr && $arr[-1] == 0 && $arr[-2] == 0) {
+          $cpost++;
+          splice @arr, -2;
+        }
+        if (@arr) {
+          splice @arr, 0, 0, (0) x (2 * $postgap) if $postgap;
+          $postgap = $cpost;
+        }
+        else {
+          $postgap += $cpost;
+        }
+      }
+      $wrote += scalar @arr;
+      print OUT pack 'v*', @arr;
+    }
+    else {
+      print OUT pack 'v*', unpack 'n*', $buf;
+    }
+    $len -= 2352;
+  }
+  if ($cut) {
+    seek OUT, 4, 0;
+    print OUT pack 'V', $wrote * 2 + 36;
+    seek OUT, 40, 0;
+    print OUT pack 'V', $wrote * 2;
+  }
+  close IN;
+  close OUT;
+}
+
+sub help() {
+  print <<EOF;
+Usage: $0 [OPTIONS] toc-file
+options:
+  -h --help      - show this message and exit
+  -c --cut       - cut pregaps and postgaps
+  -d --dir       - put files into one directory
+  -t --track     - output specified tracks only
+  -l --title     - output title list
+  -i --isrc      - output isrc list
+  -x --noout     - output title list only
+  -b --writeback - write back title list and isrc list into toc
+EOF
+  exit 0;
+}
+
+Getopt::Long::Configure('gnu_getopt'); 
+GetOptions('help|h' => \&help,
+  'cut|c!' => \$cut,
+  'dir|d!' => \$dir,
+  'track|t=i@' => \@tracks,
+  'title|l!' => \$otitle,
+  'isrc|i!' => \$oisrc,
+  'noout|x' => \$noout,
+  'writeback|b' => \$wback,
+) || help;
+
+help if $noout && !($otitle || $oisrc || $wback);
+help unless @ARGV;
+
+my @title;
+my @isrc;
+my @wb;
+
+my $tname = $ARGV[0];
+$tname =~ s/\..+$//;
+
+if ($wback) {
+  my $tfile = sprintf '%s.txt', $tname;
+  if (-r $tfile) {
+    open FILE, '<', $tfile;
+    @title = <FILE>;
+    close FILE;
+    tr/\r\n//d foreach @title;
+  }
+  my $ifile = sprintf '%s_isrc.txt', $tname;
+  if (-r $ifile) {
+    open FILE, '<', $ifile;
+    @isrc = <FILE>;
+    close FILE;
+    tr/\r\n//d foreach @isrc;
+    unshift @isrc, undef;
+  }
+}
+
+while (<>) {
+  my $out = $_;
+  if (my ($tid) = /^\s*\/\/\s+Track\s+(\d+)\s*$/) {
+    if ($aud) {
+      $aud = 0;
+      makewav($track, $fname, $off, $len, $skip);
+    }
+    $track = $tid;
+  }
+  elsif (my ($typ) = /^\s*TRACK\s+([^\s]+)\s*$/) {
+    if ($aud) {
+      $aud = 0;
+      makewav($track, $fname, $off, $len, $skip);
+      $track++;
+    }
+    if ($typ eq 'AUDIO') {
+      $aud = 1;
+      $skip = 0;
+    }
+  }
+  elsif (my ($title) = /^\s*TITLE\s+"(.*)"\s*$/) {
+    if ($wback && $title[$track]) {
+      my $tenc = $title[$track];
+      $tenc =~ s/\\/\\\\/g;
+      $tenc =~ s/([[:^print:]])/sprintf '\%03o', ord($1)/eg;
+      $tenc =~ s/"/\\"/g;
+      $out = sprintf qq(    TITLE "%s"\n), $tenc;
+    } else {
+      $title[$track] = $title;
+    }
+  }
+  elsif (my ($isrc) = /^\s*ISRC\s+"(.*)"\s*$/) {
+    if ($wback && $isrc[$track]) {
+      $out = sprintf qq(ISRC "%s"\n), $isrc[$track];
+    } else {
+      $isrc[$track] = $isrc;
+    }
+  }
+  elsif (my ($sil) = /^\s*SILENCE\s+([\d:]+)\s*$/) {
+    $skip -= time2off($sil);
+  }
+  elsif (my ($st) = /^\s*START\s+([\d:]+)\s*$/) {
+    $skip += time2off($st);
+  }
+  elsif (my @match = /^\s*FILE\s+"([^\s]+)"\s+(?:#(\d+)\s+)?([\d:]+)\s+([\d:]+)\s*$/) {
+    $fname = shift @match;
+    if ($ARGV =~ /\//) {
+      my $pname = $ARGV;
+      $pname =~ s/\/[^\/]*$//;
+      $fname = $pname . '/' . $fname;
+    }
+    $len = time2off(pop @match);
+    $off = time2off(pop @match);
+    $off += shift @match || 0;
+  }
+  push @wb, $out;
+}
+makewav($track, $fname, $off, $len, $skip) if $aud;
+
+sub unescape($) {
+  my $str = shift;
+  $str =~ s/\\(\d{3})/chr(oct($1))/eg;
+  return $str;
+}
+
+if ($otitle && @title) {
+  my $outname;
+  $outname = sprintf '%s.txt', $tname;
+  printf "title list is written in %s\n", $outname;
+  open FILE, '>', $outname;
+  print FILE unescape($_), "\n" foreach @title;
+  close FILE;
+}
+
+if ($oisrc && @isrc) {
+  my $outname = sprintf '%s_isrc.txt', $tname;
+  printf "ISRC list is written in %s\n", $outname;
+  open FILE, '>', $outname;
+  shift @isrc;
+  print FILE $_, "\n" foreach @isrc;
+  close FILE;
+}
+
+if ($wback) {
+  my $outname = sprintf '%s_wb.toc', $tname;
+  printf "Title and ISRC are written back to %s\n", $outname;
+  open FILE, '>', $outname;
+  print FILE $_ foreach @wb;
+  close FILE;
+}
